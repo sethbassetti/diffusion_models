@@ -1,0 +1,45 @@
+from torchvision import datasets
+from torch.utils.data import Dataset
+import torch
+
+T = 1000
+
+class MNISTDataset(Dataset):
+    """Dataset class that holds MNIST images for diffusion model training"""
+
+    def __init__(self):
+        super().__init__()
+
+        # Loads the data into memory
+        self.images = self.load_data()
+
+    def load_data(self):
+        """Performs the loading of the data and all normalization/standardization"""
+        
+        # Loads the MNIST dataset, downloading if it is not already downloaded
+        dataset = datasets.MNIST('./data/', train=True, download=True)
+
+        # Converts images from [0, 255) integer scale to [0,1) float scale
+        images = dataset.data / 255
+
+        # Z-score normalization: (x-mean) / std now in [-1, 1] scale
+        images = (images - images.mean())/images.std()
+
+        # Adds a channel dimension to the images
+        images = images.unsqueeze(1)
+
+        return images
+
+    def __getitem__(self, idx):
+
+        # Grabs an image from the data
+        image = self.images[idx]
+
+        # Grabs a random timestep from 1 to the total number of timesteps 
+        timestep = torch.randint(1, T, (1,))
+
+        return image, timestep
+
+    def __len__(self):
+        return len(self.images)
+
