@@ -4,6 +4,8 @@ from torch.utils.data import DataLoader
 from torchvision.utils import save_image, make_grid
 import matplotlib.pyplot as plt
 import torch.nn as nn
+import numpy as np
+import torchvision
 
 from mnist_data import MNISTDataset
 from model import UNet
@@ -12,7 +14,7 @@ import wandb
 from tqdm import tqdm
 
 # This is the amount of timesteps we can sample from
-T = 1000
+T = 300
 
 # This is our variance schedule
 BETAS = torch.linspace(0.0001, 0.02, T)
@@ -23,6 +25,17 @@ SQRT_ALPHA_CUMPROD = torch.sqrt(ALPHA_CUMPROD)                  # Sqrt of the cu
 SQRT_ONE_MINUS_ALPHA_CUMPROD = torch.sqrt(1 - ALPHA_CUMPROD)    # Sqrt of one minus alpha cumprod values
 
 
+def reverse_transform(image):
+    """ Takes in a tensor image and converts it to a PIL image"""
+
+    image = (image + 1) / 2
+
+    image *= 255
+
+
+    image = image.numpy().astype(np.uint8)
+
+    return image
 
 def forward_diff(image, t, noise=None):
     """ Given an image and a timestep (and optional noise), subjects the image to t levels of noising"""
@@ -30,7 +43,7 @@ def forward_diff(image, t, noise=None):
     t = int(t)
 
     # If noise is not given, then just initialize it to gaussian noise in the shape of the image
-    if noise == None:
+    if noise is None:
         noise = torch.randn_like(image)
 
     # The new (noised) image will have a mean centered around the original image times the alpha value
@@ -59,22 +72,30 @@ def reverse_diff(model, device):
     
     with torch.no_grad():
         # Creates a random starting noise for T=1000
-        start_noise = torch.randn(1, 1, 28, 28)
+        img = torch.randn(1, 1, 28, 28)
 
-        img = start_noise
+        # Construct a list of frames to visualize the model's progression
+        frames = [img]
 
         for t in reversed(range(0, T)):
 
             # Create a random noise to add w/ variance
             z = torch.randn(1, 1, 28, 28) if t > 1 else 0
 
+            # Calculate the mean of the new img
             model_mean = SQRT_RECIP_ALPHAS[t] * (img - (BETAS[t] * model(img.to(device)).cpu() / SQRT_ONE_MINUS_ALPHA_CUMPROD[t]))
 
+            # Calculate the variance of the new image
             variance = torch.sqrt(BETAS[t])
 
+            # New image is mean + variance * random noise
             img = model_mean + variance * z
+            
+            frames.append(img)
 
-    return img[0]
+    # Return the list of each timestep and gets rid of one of the extra dimensions
+    frames = torch.stack(frames).squeeze(1)
+    return frames
 
 def linear_beta_schedule(t):
     """Linear schedule of beta coefficients for variables for forward diffusion process"""
@@ -89,13 +110,18 @@ def construct_image_grid(model, device):
     """Constructs a 3x3 grid of images using the diffusion model"""
 
     imgs = []
+
+    # Make a list of 9 images to make a 3x3 grid
     for i in range(9):
-        imgs.append(reverse_diff(model, device))
+
+        # Take the last frame in the reverse diffusion process and append it to the list
+        img = reverse_diff(model, device)[-1]
+        imgs.append(img)
+
+    # Convert the list into a tensor and use the make_grid() function to make a grid of images
     imgs = torch.stack(imgs)
-
     return make_grid(imgs, nrow=3)
-
-
+    
 def main():
 
     # Define Hyperparameters
@@ -114,8 +140,7 @@ def main():
     criterion = nn.MSELoss()
 
     # Initialize wandb project
-    wandb.init('diffusion_testing')
-
+    wandb.init(project='diffusion_testing')
 
     for epoch in range(epochs):
 
@@ -146,11 +171,17 @@ def main():
             loss.backward()         # Send loss backwards (compute gradients)
             optimizer.step()        # Update model weights
                 
-        
+        # Construct a grid of generated images to log and convert them to a wandb object
         image_array = construct_image_grid(model, device)
         images = wandb.Image(image_array, caption='Sampled images from diffusion model')
+
+        # Construct a gif of the diffusion process and turn it into a series of numpy images
+        gif = reverse_transform(reverse_diff(model, device))
+
+        # Log all of the statistics to wandb
         wandb.log({'Loss': running_loss / len(train_loader),
-                    'Images': images})
+                    'Images': images,
+                    'Gif': wandb.Video(gif, fps=40, format='gif')})
 
 
 if __name__ == "__main__":

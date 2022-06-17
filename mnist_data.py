@@ -2,7 +2,7 @@ from torchvision import datasets
 from torch.utils.data import Dataset
 import torch
 
-T = 1000
+T = 300
 
 class MNISTDataset(Dataset):
     """Dataset class that holds MNIST images for diffusion model training"""
@@ -22,8 +22,8 @@ class MNISTDataset(Dataset):
         # Converts images from [0, 255) integer scale to [0,1) float scale
         images = dataset.data / 255
 
-        # Z-score normalization: (x-mean) / std now in [-1, 1] scale
-        images = (images - images.mean())/images.std()
+        # Standardizes image values to be between 0 and 1
+        images = images * 2 - 1
 
         # Adds a channel dimension to the images
         images = images.unsqueeze(1)
