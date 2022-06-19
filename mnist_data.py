@@ -2,16 +2,17 @@ from torchvision import datasets
 from torch.utils.data import Dataset
 import torch
 
-T = 300
-
 class MNISTDataset(Dataset):
     """Dataset class that holds MNIST images for diffusion model training"""
 
-    def __init__(self):
+    def __init__(self, T):
         super().__init__()
 
         # Loads the data into memory
         self.images = self.load_data()
+
+        # Used to randomly select a timestep when grabbing image from the dataset
+        self.max_timestep = T
 
     def load_data(self):
         """Performs the loading of the data and all normalization/standardization"""
@@ -36,7 +37,7 @@ class MNISTDataset(Dataset):
         image = self.images[idx]
 
         # Grabs a random timestep from 1 to the total number of timesteps 
-        timestep = torch.randint(1, T, (1,))
+        timestep = torch.randint(1, self.max_timestep, (1,))
 
         return image, timestep
 

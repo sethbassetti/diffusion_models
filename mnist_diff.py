@@ -14,7 +14,7 @@ import wandb
 from tqdm import tqdm
 
 # This is the amount of timesteps we can sample from
-T = 300
+T = 600
 
 # This is our variance schedule
 BETAS = torch.linspace(0.0001, 0.02, T)
@@ -129,13 +129,14 @@ def main():
     epochs = 20
     lr = 0.0001
     device = 0
+    depth = 2
 
     # Define the dataset and dataloader
-    train_set = MNISTDataset()
+    train_set = MNISTDataset(T)
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=8)
 
     # Define model, optimizer, and loss function
-    model = UNet().to(device)
+    model = UNet(depth).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
 
