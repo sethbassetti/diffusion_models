@@ -5,7 +5,6 @@ from torchvision.utils import save_image, make_grid
 import matplotlib.pyplot as plt
 import torch.nn as nn
 import numpy as np
-import torchvision
 
 from mnist_data import MNISTDataset
 from model import UNet
@@ -14,7 +13,7 @@ import wandb
 from tqdm import tqdm
 
 # This is the amount of timesteps we can sample from
-T = 600
+T = 1000
 
 # This is our variance schedule
 BETAS = torch.linspace(0.0001, 0.02, T)
@@ -68,11 +67,11 @@ def apply_noise(images, timesteps, noises):
     # Return a tensor of images, instead of a list
     return torch.stack(noised_images)
 
-def reverse_diff(model, device):
+def reverse_diff(model, device, image_size, image_channels):
     
     with torch.no_grad():
         # Creates a random starting noise for T=1000
-        img = torch.randn(1, 1, 28, 28)
+        img = torch.randn(1, image_channels, image_size, image_size)
 
         # Construct a list of frames to visualize the model's progression
         frames = [img]
@@ -80,10 +79,10 @@ def reverse_diff(model, device):
         for t in reversed(range(0, T)):
 
             # Create a random noise to add w/ variance
-            z = torch.randn(1, 1, 28, 28) if t > 1 else 0
+            z = torch.randn(1, image_channels, image_size, image_size) if t > 1 else 0
 
             # Calculate the mean of the new img
-            model_mean = SQRT_RECIP_ALPHAS[t] * (img - (BETAS[t] * model(img.to(device)).cpu() / SQRT_ONE_MINUS_ALPHA_CUMPROD[t]))
+            model_mean = SQRT_RECIP_ALPHAS[t] * (img - (BETAS[t] * model(img.to(device), torch.tensor([t])).cpu() / SQRT_ONE_MINUS_ALPHA_CUMPROD[t]))
 
             # Calculate the variance of the new image
             variance = torch.sqrt(BETAS[t])
@@ -106,7 +105,7 @@ def imshow(image):
     plt.imshow(image, cmap='gray')
     plt.show()
 
-def construct_image_grid(model, device):
+def construct_image_grid(model, device, image_size, image_channels):
     """Constructs a 3x3 grid of images using the diffusion model"""
 
     imgs = []
@@ -115,7 +114,7 @@ def construct_image_grid(model, device):
     for i in range(9):
 
         # Take the last frame in the reverse diffusion process and append it to the list
-        img = reverse_diff(model, device)[-1]
+        img = reverse_diff(model, device, image_size, image_channels)[-1]
         imgs.append(img)
 
     # Convert the list into a tensor and use the make_grid() function to make a grid of images
@@ -125,18 +124,21 @@ def construct_image_grid(model, device):
 def main():
 
     # Define Hyperparameters
-    batch_size = 32
-    epochs = 20
-    lr = 0.0001
+    batch_size = 128
+    epochs = 40
+    lr = 2e-4
     device = 0
     depth = 2
+
+    image_size = 28
+    image_channels = 1
 
     # Define the dataset and dataloader
     train_set = MNISTDataset(T)
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=8)
 
     # Define model, optimizer, and loss function
-    model = UNet(depth).to(device)
+    model = UNet(depth, T=T, img_start_channels = image_channels).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
 
@@ -161,7 +163,7 @@ def main():
             noised_images, noises = noised_images.to(device), noises.to(device)
     
             # Predict the noise used to noise each image
-            predicted_noise = model(noised_images)
+            predicted_noise = model(noised_images, timesteps)
 
             # Apply loss to each prediction and update count
             loss = criterion(predicted_noise, noises)
@@ -173,16 +175,16 @@ def main():
             optimizer.step()        # Update model weights
                 
         # Construct a grid of generated images to log and convert them to a wandb object
-        image_array = construct_image_grid(model, device)
+        image_array = construct_image_grid(model, device, image_size, image_channels)
         images = wandb.Image(image_array, caption='Sampled images from diffusion model')
 
         # Construct a gif of the diffusion process and turn it into a series of numpy images
-        gif = reverse_transform(reverse_diff(model, device))
+        gif = reverse_transform(reverse_diff(model, device, image_size, image_channels))
 
         # Log all of the statistics to wandb
         wandb.log({'Loss': running_loss / len(train_loader),
                     'Images': images,
-                    'Gif': wandb.Video(gif, fps=40, format='gif')})
+                    'Gif': wandb.Video(gif, fps=60, format='gif')})
 
 
 if __name__ == "__main__":

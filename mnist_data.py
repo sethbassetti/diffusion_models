@@ -1,4 +1,4 @@
-from torchvision import datasets
+from torchvision import datasets, transforms
 from torch.utils.data import Dataset
 import torch
 
@@ -17,8 +17,11 @@ class MNISTDataset(Dataset):
     def load_data(self):
         """Performs the loading of the data and all normalization/standardization"""
         
+        # Randomly flip half of the images horizontally
+        transform = transforms.RandomHorizontalFlip()
+
         # Loads the MNIST dataset, downloading if it is not already downloaded
-        dataset = datasets.MNIST('./data/', train=True, download=True)
+        dataset = datasets.CIFAR10('./data/', train=True, download=True)
 
         # Converts images from [0, 255) integer scale to [0,1) float scale
         images = dataset.data / 255
@@ -26,8 +29,8 @@ class MNISTDataset(Dataset):
         # Standardizes image values to be between 0 and 1
         images = images * 2 - 1
 
-        # Adds a channel dimension to the images
-        images = images.unsqueeze(1)
+        # Adds a channel dimension to the images and applies the transform to them
+        images = transform(images.unsqueeze(1))
 
         return images
 
