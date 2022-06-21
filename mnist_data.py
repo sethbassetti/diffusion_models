@@ -20,11 +20,14 @@ class MNISTDataset(Dataset):
         # Randomly flip half of the images horizontally
         transform = transforms.RandomHorizontalFlip()
 
-        # Loads the MNIST dataset, downloading if it is not already downloaded
-        dataset = datasets.CIFAR10('./data/', train=True, download=True)
+        # Loads the dataset, downloading if it is not already downloaded and converts it into pytorch
+        dataset = datasets.FashionMNIST('./data/', train=True, download=True).data
+
+        # N x H x W x C -> N x C x H x W
+        #dataset = dataset.permute(0, 3, 1, 2)
 
         # Converts images from [0, 255) integer scale to [0,1) float scale
-        images = dataset.data / 255
+        images = dataset / 255
 
         # Standardizes image values to be between 0 and 1
         images = images * 2 - 1

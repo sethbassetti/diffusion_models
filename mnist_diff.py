@@ -1,9 +1,14 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 from torchvision.utils import save_image, make_grid
 import matplotlib.pyplot as plt
-import torch.nn as nn
+import torch.distributed as dist
+import torch.multiprocessing as mp
+
+import os
+
+from torch.nn.parallel import DistributedDataParallel as DDP
 import numpy as np
 
 from mnist_data import MNISTDataset
@@ -27,12 +32,14 @@ SQRT_ONE_MINUS_ALPHA_CUMPROD = torch.sqrt(1 - ALPHA_CUMPROD)    # Sqrt of one mi
 def reverse_transform(image):
     """ Takes in a tensor image and converts it to a PIL image"""
 
+    # Range [-1, 1]-> [0, 1)
     image = (image + 1) / 2
 
+    # Range [0, 1) -> [0, 255)
     image *= 255
 
-
     image = image.numpy().astype(np.uint8)
+
 
     return image
 
@@ -67,11 +74,13 @@ def apply_noise(images, timesteps, noises):
     # Return a tensor of images, instead of a list
     return torch.stack(noised_images)
 
-def reverse_diff(model, device, image_size, image_channels):
+def reverse_diff(model, device, image_size, image_channels, batch_size=1):
     
+
     with torch.no_grad():
+
         # Creates a random starting noise for T=1000
-        img = torch.randn(1, image_channels, image_size, image_size)
+        img = torch.randn(batch_size, image_channels, image_size, image_size)
 
         # Construct a list of frames to visualize the model's progression
         frames = [img]
@@ -79,10 +88,11 @@ def reverse_diff(model, device, image_size, image_channels):
         for t in reversed(range(0, T)):
 
             # Create a random noise to add w/ variance
-            z = torch.randn(1, image_channels, image_size, image_size) if t > 1 else 0
+            z = torch.randn(batch_size, image_channels, image_size, image_size) if t > 1 else 0
 
+            timesteps = torch.full((batch_size, 1), t)
             # Calculate the mean of the new img
-            model_mean = SQRT_RECIP_ALPHAS[t] * (img - (BETAS[t] * model(img.to(device), torch.tensor([t])).cpu() / SQRT_ONE_MINUS_ALPHA_CUMPROD[t]))
+            model_mean = SQRT_RECIP_ALPHAS[t] * (img - (BETAS[t] * model(img.to(device), timesteps).cpu() / SQRT_ONE_MINUS_ALPHA_CUMPROD[t]))
 
             # Calculate the variance of the new image
             variance = torch.sqrt(BETAS[t])
@@ -105,40 +115,33 @@ def imshow(image):
     plt.imshow(image, cmap='gray')
     plt.show()
 
-def construct_image_grid(model, device, image_size, image_channels):
+def construct_image_grid(model, device, image_size, image_channels, num_imgs):
     """Constructs a 3x3 grid of images using the diffusion model"""
 
-    imgs = []
+    imgs = reverse_diff(model, device, image_size, image_channels, num_imgs)[-1]
 
-    # Make a list of 9 images to make a 3x3 grid
-    for i in range(9):
-
-        # Take the last frame in the reverse diffusion process and append it to the list
-        img = reverse_diff(model, device, image_size, image_channels)[-1]
-        imgs.append(img)
-
-    # Convert the list into a tensor and use the make_grid() function to make a grid of images
-    imgs = torch.stack(imgs)
     return make_grid(imgs, nrow=3)
-    
+
+
 def main():
 
     # Define Hyperparameters
     batch_size = 128
-    epochs = 40
+    epochs = 100
     lr = 2e-4
     device = 0
-    depth = 2
+    channel_space = 64
 
     image_size = 28
     image_channels = 1
+    dim_mults = (1, 2)
 
     # Define the dataset and dataloader
     train_set = MNISTDataset(T)
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=8)
+    train_loader = DataLoader(train_set, batch_size=batch_size, num_workers=8, shuffle=True)
 
     # Define model, optimizer, and loss function
-    model = UNet(depth, T=T, img_start_channels = image_channels).to(device)
+    model = UNet(T=T, img_start_channels = image_channels, channel_space=channel_space, time_emb_dim=128, dim_mults=dim_mults).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
 
@@ -161,7 +164,7 @@ def main():
 
             # Cast inputs and targets to device
             noised_images, noises = noised_images.to(device), noises.to(device)
-    
+
             # Predict the noise used to noise each image
             predicted_noise = model(noised_images, timesteps)
 
@@ -175,7 +178,7 @@ def main():
             optimizer.step()        # Update model weights
                 
         # Construct a grid of generated images to log and convert them to a wandb object
-        image_array = construct_image_grid(model, device, image_size, image_channels)
+        image_array = construct_image_grid(model, device, image_size, image_channels, 9)
         images = wandb.Image(image_array, caption='Sampled images from diffusion model')
 
         # Construct a gif of the diffusion process and turn it into a series of numpy images
@@ -185,6 +188,8 @@ def main():
         wandb.log({'Loss': running_loss / len(train_loader),
                     'Images': images,
                     'Gif': wandb.Video(gif, fps=60, format='gif')})
+
+        torch.save(model.state_dict(), 'weights.pt')
 
 
 if __name__ == "__main__":
