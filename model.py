@@ -60,18 +60,17 @@ def get_time_embedding(timesteps, embed_dim):
 
     assert embed_dim % 2 == 0, "Dimension of timestep embeddings must be divisible by 2"
 
+    device = timesteps.device
+
     # Half of the indices will be sin and half will be cos
     half_dim = embed_dim // 2
 
     # Sinusoidal embedding equation
     embedding = math.log(10000) / (half_dim - 1)
-    embedding = torch.exp(torch.arange(half_dim, dtype=torch.float32) * -embedding)
-
-    # Cast the embedding to same device as the timesteps
-    embedding = embedding.to(timesteps.device)
+    embedding = torch.exp(torch.arange(half_dim, device=device) * -embedding)
 
     # Matrix multiplication to create N x D matrix
-    embedding = timesteps.float() * embedding.unsqueeze(0)
+    embedding = timesteps[:, None] * embedding[None, :]
 
     # First half of embeddings are sine and second half are cosine
     embedding = torch.cat([torch.sin(embedding), torch.cos(embedding)], dim=1)

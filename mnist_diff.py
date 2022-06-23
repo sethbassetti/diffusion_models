@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
 from torchvision.utils import save_image, make_grid
 import matplotlib.pyplot as plt
@@ -21,7 +22,7 @@ from PIL import Image
 from tqdm import tqdm
 
 # This is the amount of timesteps we can sample from
-T = 4000
+T = 300
 
 # A fixed hyperparameter for the cosine scheduler
 S = 0.008
@@ -31,15 +32,15 @@ def linear_schedule(timesteps):
 
 def cosine_schedule(timesteps):
 
-    max_beta = 0.999
+    steps = timesteps + 1
+    x = torch.linspace(0, timesteps, steps)
 
-    # The equation for f(t) to get alpha prod values
-    f_t = lambda t: math.cos(((t / timesteps + S) / (S + 1)) * (math.pi / 2)) ** 2
+    alphas_cumprod = torch.cos(((x / timesteps) + S) / (1 + S) * torch.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
 
-    # Construct a list of beta values
-    betas = [min(1 - f_t(i+1) / f_t(i), max_beta) for i in range(timesteps)]
+    return torch.clip(betas, 0.0001, 0.9999)
 
-    return torch.tensor(betas)
 
 
 # This is our variance schedule
@@ -47,9 +48,11 @@ BETAS = linear_schedule(T)
 ALPHAS = 1 - BETAS                                              # See paper
 SQRT_RECIP_ALPHAS = 1.0 / torch.sqrt(ALPHAS)                    # Reciprocal of square root of alpha values                              
 ALPHA_CUMPROD = torch.cumprod(ALPHAS, dim=0)                    # Cumulative product of the alpha values
+ALPHA_CUMPROD_PREV = F.pad(ALPHA_CUMPROD[:-1],(1, 0),value=1.0) # Pads the last element with a 1
 SQRT_ALPHA_CUMPROD = torch.sqrt(ALPHA_CUMPROD)                  # Sqrt of the cumulative product of alpha values
 SQRT_ONE_MINUS_ALPHA_CUMPROD = torch.sqrt(1 - ALPHA_CUMPROD)    # Sqrt of one minus alpha cumprod values
 
+POSTERIOR_VARIANCE = BETAS * (1.0 - ALPHA_CUMPROD_PREV) / (1.0 - ALPHA_CUMPROD)
 
 def reverse_transform(image):
     """ Takes in a tensor image and converts it to a uint8 numpy array"""
@@ -63,17 +66,18 @@ def reverse_transform(image):
 def forward_diff(image, t, noise=None):
     """ Given an image and a timestep (and optional noise), subjects the image to t levels of noising"""
 
-    t = int(t)
-
     # If noise is not given, then just initialize it to gaussian noise in the shape of the image
     if noise is None:
         noise = torch.randn_like(image)
 
+    sqrt_alpha_cumprod = extract(SQRT_ALPHA_CUMPROD, t, image.shape)
+    sqrt_one_minus_alpha_cumprod = extract(SQRT_ONE_MINUS_ALPHA_CUMPROD, t, image.shape)
+
     # The new (noised) image will have a mean centered around the original image times the alpha value
-    mean = SQRT_ALPHA_CUMPROD[t] * image
+    mean = sqrt_alpha_cumprod * image
 
     # The variance will be controlled by the multiplication of the beta schedules
-    variance = SQRT_ONE_MINUS_ALPHA_CUMPROD[t]
+    variance = sqrt_one_minus_alpha_cumprod
 
     # Push the gaussian distribution to center on our image with the appropriate variance
     noised_image = noise * variance + mean
@@ -91,46 +95,61 @@ def apply_noise(images, timesteps, noises):
     # Return a tensor of images, instead of a list
     return torch.stack(noised_images)
 
-def reverse_diff(model, device, image_size, image_channels, batch_size=1):
+def p_sample(model, x, t, t_index):
+
+    # Extract each constant and reshape to shape of image
+    betas = extract(BETAS, t, x.shape)
+    sqrt_recip_alphas = extract(SQRT_RECIP_ALPHAS, t, x.shape)
+    sqrt_one_minus_alpha_cumprod = extract(SQRT_ONE_MINUS_ALPHA_CUMPROD, t, x.shape)
+
+    # Calculate the mean of the new img
+    model_mean = sqrt_recip_alphas * (x - (betas * model(x, t) / sqrt_one_minus_alpha_cumprod))
+
+    # If at the last timestep, just return mean without any noise
+    if t_index == 0:
+        return model_mean
+    else:
+        # Otherwise calculate posterior variance, random noise, and return that added to the predicted mean
+        posterior_variance = extract(POSTERIOR_VARIANCE, t, x.shape)
+        noise = torch.randn_like(x)
+
+        return model_mean + torch.sqrt(posterior_variance) * noise
+
+
+@torch.no_grad()
+def reverse_diff(model, shape):
+    """Constructs a sequence of frames of the denoising process"""
+    device = next(model.parameters()).device
+
+    b = shape[0]
+
+    # Start imgs out with random noise
+    img = torch.randn(shape, device=device)
+
+    imgs = []
     
+    # Loops through each timestep to get to the generated image
+    for i in tqdm(reversed(range(0, T)), desc='sampling loop time step', total=T):
 
-    with torch.no_grad():
+        # Samples from the specific timestep
+        img = p_sample(model, img, torch.full((b,), i, device=device), i)
+        imgs.append(img.cpu())
 
-        # Creates a random starting noise for T=1000
-        img = torch.randn(batch_size, image_channels, image_size, image_size)
+    return imgs
 
-        # Construct a list of frames to visualize the model's progression
-        frames = [img]
 
-        for t in reversed(range(0, T)):
-
-            # Create a random noise to add w/ variance
-            z = torch.randn(batch_size, image_channels, image_size, image_size) if t > 1 else 0
-
-            timesteps = torch.full((batch_size, 1), t)
-            # Calculate the mean of the new img
-            model_mean = SQRT_RECIP_ALPHAS[t] * (img - (BETAS[t] * model(img.to(device), timesteps.to(device)).cpu() / SQRT_ONE_MINUS_ALPHA_CUMPROD[t]))
-
-            # Calculate the variance of the new image
-            posterior_variance = math.sqrt(BETAS[t] * (1.0 - ALPHA_CUMPROD[t-1]) / (1.0 - ALPHA_CUMPROD[t]))
-
-            # New image is mean + variance * random noise
-            img = model_mean + posterior_variance * z
-            
-            frames.append(img)
-
-    # Return the list of each timestep and gets rid of one of the extra dimensions
-    frames = torch.stack(frames).squeeze(1)
-    return frames
-
-def linear_beta_schedule(t):
-    """Linear schedule of beta coefficients for variables for forward diffusion process"""
-    return torch.linspace(0.0001, 0.02, t)
 
 def imshow(image):
     """Helper function for displaying images"""
     plt.imshow(image, cmap='gray')
     plt.show()
+
+def extract(a, t, x_shape):
+    """ Helper function to extract indices from a tensor and reshape them"""
+
+    batch_size = t.shape[0]
+    out = a.gather(-1, t.cpu())
+    return out.reshape(batch_size, *((1,) * (len(x_shape) - 1))).to(t.device)
 
 def construct_image_grid(model, device, image_size, image_channels, num_imgs):
     """Constructs a 3x3 grid of images using the diffusion model"""
@@ -158,7 +177,7 @@ def main():
     model_checkpoint = None
 
     # Define the dataset and dataloader
-    train_set = MNISTDataset(T)
+    train_set = MNISTDataset()
     train_loader = DataLoader(train_set, batch_size=batch_size, num_workers=8, shuffle=True)
 
     # Define model, optimizer, and loss function
@@ -170,7 +189,7 @@ def main():
         model.load_state_dict(torch.load(model_checkpoint))
 
     # Initialize wandb project
-    wandb.init(project='diffusion_testing')
+    wandb.init(project='diffusion_testing', settings=wandb.Settings(start_method='fork'))
 
     # Keep track of training iterations
     count = 0
@@ -183,18 +202,21 @@ def main():
         running_loss = 0
 
         # Iterate over batch of images and random timesteps
-        for images, timesteps in tqdm(train_loader):
+        for images, _ in tqdm(train_loader, desc=f'Epoch {epoch}'):
+            
+            # Cast image to device
+            images = images.to(device)
 
             # Define gaussian noise to be applied to this image
             noises = torch.randn_like(images)
+
+            # Define a series of random timesteps to sample noise from
+            timesteps = torch.randint(0, T, (images.shape[0], ), device=device, dtype=torch.long)
             
             # Apply noise to each image at each timestep with each gaussian noise
-            noised_images = apply_noise(images, timesteps, noises)
+            noised_images = forward_diff(images, timesteps, noises)
 
-            # Cast inputs, targets, and timesteps to device
-            noised_images, noises, timesteps = map(lambda x: x.to(device), [noised_images, noises, timesteps])
-
-            # Predict the noise used to noise each image
+            # Predict epsilon, the noise used to noise each image
             predicted_noise = model(noised_images, timesteps)
 
             # Apply loss to each prediction and update count
@@ -205,28 +227,35 @@ def main():
             optimizer.zero_grad()   # Zero out gradients
             loss.backward()         # Send loss backwards (compute gradients)
             optimizer.step()        # Update model weights
-            count += 1
+            count += 1              # Keep track of num of updates
         
         # Set model to evaluation mode before doing validation steps
         model.eval()
 
-        # Construct a grid of generated images to log and convert them to a wandb object
-        image_array = construct_image_grid(model, device, image_size, image_channels, n_log_images)
-        gen_images = wandb.Image(image_array, caption='Sampled images from diffusion model')
+       
 
         # Grab random samples from the training set and convert them into wandb image for logging
-        real_images = train_set[random.randint(0, len(train_set) - 1)][0]
-        image = reverse_transform(real_images).squeeze()
-        image = wandb.Image(Image.fromarray(image), caption="test")
+        real_images = torch.stack([train_set[random.randint(0, len(train_set)-1)][0] for _ in range(n_log_images)])
+        #for i in range(n_log_images):
+            #real_images.append(train_set[random.randint(0, len(train_set) - 1)][0])
+        #real_images = torch.stack(real_images)
 
-        # Construct a gif of the diffusion process and turn it into a series of numpy images
-        gif = reverse_transform(reverse_diff(model, device, image_size, image_channels))
+        real_img_grid = make_grid(real_images, nrow=3, normalize=True)
+
+        # Generate a batch of images
+        gen_imgs = reverse_diff(model, (n_log_images, image_channels, image_size, image_size))
+
+        # Make the last (t=0) slice of images into a grid
+        gen_img_grid = make_grid(gen_imgs[-1], nrow=3, normalize=True)
+
+        # Take all of the frames from the reverse diffusion process for an image and convert it into numpy array
+        gif = reverse_transform(torch.stack(gen_imgs)[:,0])
 
         # Log all of the statistics to wandb
         wandb.log({'Loss': running_loss / len(train_loader),
                     'Training Iters': count,
-                    'Generated Images': gen_images,
-                    'Real Images': image,
+                    'Generated Images': wandb.Image(gen_img_grid, caption="Generated Images"),
+                    'Real Images': wandb.Image(real_img_grid, caption='Real Images'),
                     'Gif': wandb.Video(gif, fps=60, format='gif')})
 
         # Save the model checkpoint somewhere
