@@ -1,4 +1,5 @@
 import torch.nn as nn
+import math
 import torch
 
 class Attention(nn.Module):
@@ -35,54 +36,62 @@ class Attention(nn.Module):
         out = out.reshape(batch_size, -1, height, width)
         return self.to_out(out)
 
-
-
-class TimeEmbedding(nn.Module):
-    """A module that converts a timestep into an embedding vector"""
-
-    def __init__(self, dim, T):
-
+class PreNorm(nn.Module):
+    def __init__(self, dim, fn):
         super().__init__()
-        # Dimensionality of the time embedding vector
-        self.dim = dim
+        self.fn = fn
+        self.norm = nn.GroupNorm(1, dim)
 
-        # The maximum timestep this can hold
-        self.max_timestep = T
+    def forward(self, x):
+        x = self.norm(x)
+        return self.fn(x)
 
-        # Create matrices holding 0...T and 0...dim 
-        timesteps = torch.arange(0, T).unsqueeze(1)
-        dim_indices = torch.arange(0, dim).unsqueeze(0)
+class Residual(nn.Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
 
-        # This is the term that position will be divided by
-        div_term = 10000 ** (2 * dim_indices / dim)
+    def forward(self, x, *args, **kwargs):
+        return self.fn(x, *args, **kwargs) + x
 
-        # Multiplies all of the positions (timesteps) to obtain a T x dim matrix
-        pe_matrix = timesteps / div_term
 
-        # Convert even indices to sin and odd indices to cos
-        pe_matrix[:, 0::2] = torch.sin(pe_matrix[:, 0::2])
-        pe_matrix[:, 1::2] = torch.cos(pe_matrix[:, 1::2])
-        
-        # Register this as a (non-learnable) parameter to this module
-        self.register_buffer('pe_matrix', pe_matrix)
+def get_time_embedding(timesteps, embed_dim):
+    """Returns an T x D matrix, where T = number of timesteps and D = embedding dimension """
 
-    def forward(self, t):
-        """Looks up the timestep embedding for a specific timestep, t""" 
+    assert embed_dim % 2 == 0, "Dimension of timestep embeddings must be divisible by 2"
 
-        return self.pe_matrix[t]
+    # Half of the indices will be sin and half will be cos
+    half_dim = embed_dim // 2
+
+    # Sinusoidal embedding equation
+    embedding = math.log(10000) / (half_dim - 1)
+    embedding = torch.exp(torch.arange(half_dim, dtype=torch.float32) * -embedding)
+
+    # Cast the embedding to same device as the timesteps
+    embedding = embedding.to(timesteps.device)
+
+    # Matrix multiplication to create N x D matrix
+    embedding = timesteps.float() * embedding.unsqueeze(0)
+
+    # First half of embeddings are sine and second half are cosine
+    embedding = torch.cat([torch.sin(embedding), torch.cos(embedding)], dim=1)
+    return embedding
 
 
 class ConvBlock(nn.Module):
     """Block used within the resnet, a simple convolutional layer with groupnorm and leaky relu"""
 
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, dropout=0.0):
         super().__init__()
+
+        dropout = nn.Dropout(p=dropout)
 
         # Defines the main conv layer building block of the resnet
         self.block = nn.Sequential(
+            nn.GroupNorm(32, in_channels),
+            nn.SiLU(),
+            dropout,
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding='same'),
-            nn.GroupNorm(8, out_channels),
-            nn.LeakyReLU()
         )
 
     def forward(self, x):
@@ -94,15 +103,14 @@ class WideResBlock(nn.Module):
     """ The main building block of the UNet Architecture. Uses residual connections and sends x through
     two convolutional blocks, along with inserting the time embedding into it"""
 
-    def __init__(self, in_channels, out_channels, time_emb_dim=128):
+    def __init__(self, in_channels, out_channels, time_emb_dim=256, dropout=0.1):
         super().__init__()
 
         # Main building block, increasing channel size
         self.block1 = ConvBlock(in_channels, out_channels)
-        self.block2 = ConvBlock(out_channels, out_channels)
+        self.block2 = ConvBlock(out_channels, out_channels, dropout=dropout)
 
-        self.time_mlp = nn.Sequential(nn.LeakyReLU(), nn.Linear(time_emb_dim, out_channels))
-
+        self.time_mlp = nn.Sequential(nn.SiLU(), nn.Linear(time_emb_dim, out_channels))
 
         # Residual connection block, reshapes in channels to out channels to add residual if channels are different
         self.res_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
@@ -125,15 +133,21 @@ class WideResBlock(nn.Module):
 class UNet(nn.Module):
 
 
-    def __init__(self, img_start_channels=1, channel_space=64, time_emb_dim=64, T=1000, dim_mults=(1, 2, 2, 2)):
+    def __init__(self, img_start_channels=1, channel_space=64, dim_mults=(1, 2, 2, 2)):
         super().__init__()
 
 
         self.channel_space = channel_space
+        self.time_dim = channel_space * 4
         self.start_channels = img_start_channels
         self.dim_mults = dim_mults
 
-        self.time_embedding = TimeEmbedding(time_emb_dim, T)
+        self.time_linear = nn.Sequential(nn.Linear(self.channel_space, self.time_dim),
+                                            nn.LeakyReLU(),
+                                            nn.Linear(self.time_dim, self.time_dim))
+
+        # First convolutional block, brings image to channel space
+        self.input_conv = nn.Conv2d(img_start_channels, channel_space, 3, padding=1)
 
         # Builds the series of contrastive blocks leading to the bottleneck
         self.contrastives = self.build_contrastives()
@@ -143,6 +157,7 @@ class UNet(nn.Module):
         
         # Defines the two bottleneck layers and converts it into a sequential model
         self.bottleneck_1 = WideResBlock(bottleneck_depth, bottleneck_depth)
+        self.mid_attn = Residual(PreNorm(bottleneck_depth, Attention(bottleneck_depth)))
         self.bottleneck_2 = WideResBlock(bottleneck_depth, bottleneck_depth)
 
         # Builds the series of expansive blocks leading to the output
@@ -159,10 +174,8 @@ class UNet(nn.Module):
         # Initialize a module list to contain all of the contrastive blocks
         blocks = nn.ModuleList()
 
-        downsample_op = nn.MaxPool2d(2)
-
         # Images will start as 1 channel (grayscale) and turn into 64 feature maps
-        in_channels = self.start_channels
+        in_channels = self.channel_space
 
         # Iterate through each level to construct a conv block and downsample operation
         for scale in self.dim_mults:
@@ -175,7 +188,9 @@ class UNet(nn.Module):
             res_block_2 = WideResBlock(out_channels, out_channels)
             res_block_3 = WideResBlock(out_channels, out_channels)
 
-            attn = Attention(out_channels) if scale == 2 else nn.Identity()
+            attn = Residual(PreNorm(out_channels, Attention(out_channels))) if scale == 2 else nn.Identity()
+
+            downsample_op = nn.Conv2d(out_channels, out_channels, kernel_size=4, stride=2, padding=1)
 
             # Each block will consist of a convolutional block and a downsample operation
             block = nn.ModuleList([res_block_1, res_block_2, res_block_3, attn, downsample_op])
@@ -206,7 +221,7 @@ class UNet(nn.Module):
             res_block_2 = WideResBlock(out_channels, out_channels)
             res_block_3 = WideResBlock(out_channels, out_channels)
 
-            attn = Attention(out_channels) if scale == 2 else nn.Identity()
+            attn = Residual(PreNorm(out_channels, Attention(out_channels))) if scale == 2 else nn.Identity()
 
             # Create a block that holds the convolutional block and the upsampling operation
             blocks.append(nn.ModuleList([res_block_1, res_block_2, res_block_3, attn, upsample_op]))
@@ -222,9 +237,13 @@ class UNet(nn.Module):
         # This is the list of residuals to pass across the UNet
         h = [] 
 
-        # Create a fixed time embedding from t
-        t = self.time_embedding(t)
-        
+        # Create a fixed time embedding from t and project it to a higher dimensional space
+        t = get_time_embedding(t, self.channel_space)
+        t = self.time_linear(t)
+
+
+        x = self.input_conv(x)
+
         # Iterate through each level of the contrastive portion of the model
         for block_1, block_2, block_3, attn, downsample_op in self.contrastives:
 
@@ -238,6 +257,7 @@ class UNet(nn.Module):
 
         # Send x through bottleneck at bottom of model
         x = self.bottleneck_1(x, t)
+        x = self.mid_attn(x)
         x = self.bottleneck_2(x, t)
 
         # Iterate through the expansive, upsampling part of the model

@@ -5,9 +5,11 @@ from torchvision.utils import save_image, make_grid
 import matplotlib.pyplot as plt
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import math
 
 import os
 
+import random
 from torch.nn.parallel import DistributedDataParallel as DDP
 import numpy as np
 
@@ -15,13 +17,33 @@ from mnist_data import MNISTDataset
 from model import UNet
 
 import wandb
+from PIL import Image
 from tqdm import tqdm
 
 # This is the amount of timesteps we can sample from
-T = 1000
+T = 4000
+
+# A fixed hyperparameter for the cosine scheduler
+S = 0.008
+
+def linear_schedule(timesteps):
+    return torch.linspace(0.0001, 0.02, timesteps)
+
+def cosine_schedule(timesteps):
+
+    max_beta = 0.999
+
+    # The equation for f(t) to get alpha prod values
+    f_t = lambda t: math.cos(((t / timesteps + S) / (S + 1)) * (math.pi / 2)) ** 2
+
+    # Construct a list of beta values
+    betas = [min(1 - f_t(i+1) / f_t(i), max_beta) for i in range(timesteps)]
+
+    return torch.tensor(betas)
+
 
 # This is our variance schedule
-BETAS = torch.linspace(0.0001, 0.02, T)
+BETAS = linear_schedule(T)
 ALPHAS = 1 - BETAS                                              # See paper
 SQRT_RECIP_ALPHAS = 1.0 / torch.sqrt(ALPHAS)                    # Reciprocal of square root of alpha values                              
 ALPHA_CUMPROD = torch.cumprod(ALPHAS, dim=0)                    # Cumulative product of the alpha values
@@ -30,16 +52,11 @@ SQRT_ONE_MINUS_ALPHA_CUMPROD = torch.sqrt(1 - ALPHA_CUMPROD)    # Sqrt of one mi
 
 
 def reverse_transform(image):
-    """ Takes in a tensor image and converts it to a PIL image"""
+    """ Takes in a tensor image and converts it to a uint8 numpy array"""
 
-    # Range [-1, 1]-> [0, 1)
-    image = (image + 1) / 2
-
-    # Range [0, 1) -> [0, 255)
-    image *= 255
-
-    image = image.numpy().astype(np.uint8)
-
+    image = (image + 1) / 2                 # Range [-1, 1] -> [0, 1)
+    image *= 255                            # Range [0, 1) -> [0, 255)
+    image = image.numpy().astype(np.uint8)  # Cast image to numpy and make it an unsigned integer type (no negatives)
 
     return image
 
@@ -92,13 +109,13 @@ def reverse_diff(model, device, image_size, image_channels, batch_size=1):
 
             timesteps = torch.full((batch_size, 1), t)
             # Calculate the mean of the new img
-            model_mean = SQRT_RECIP_ALPHAS[t] * (img - (BETAS[t] * model(img.to(device), timesteps).cpu() / SQRT_ONE_MINUS_ALPHA_CUMPROD[t]))
+            model_mean = SQRT_RECIP_ALPHAS[t] * (img - (BETAS[t] * model(img.to(device), timesteps.to(device)).cpu() / SQRT_ONE_MINUS_ALPHA_CUMPROD[t]))
 
             # Calculate the variance of the new image
-            variance = torch.sqrt(BETAS[t])
+            posterior_variance = math.sqrt(BETAS[t] * (1.0 - ALPHA_CUMPROD[t-1]) / (1.0 - ALPHA_CUMPROD[t]))
 
             # New image is mean + variance * random noise
-            img = model_mean + variance * z
+            img = model_mean + posterior_variance * z
             
             frames.append(img)
 
@@ -120,7 +137,7 @@ def construct_image_grid(model, device, image_size, image_channels, num_imgs):
 
     imgs = reverse_diff(model, device, image_size, image_channels, num_imgs)[-1]
 
-    return make_grid(imgs, nrow=3)
+    return make_grid(imgs, nrow=int(math.sqrt(num_imgs)))
 
 
 def main():
@@ -129,26 +146,38 @@ def main():
     batch_size = 128
     epochs = 100
     lr = 2e-4
-    device = 0
+    device = 1
     channel_space = 64
 
     image_size = 28
     image_channels = 1
     dim_mults = (1, 2)
 
+    n_log_images = 9        # How many images to log to wandb each epoch
+
+    model_checkpoint = None
+
     # Define the dataset and dataloader
     train_set = MNISTDataset(T)
     train_loader = DataLoader(train_set, batch_size=batch_size, num_workers=8, shuffle=True)
 
     # Define model, optimizer, and loss function
-    model = UNet(T=T, img_start_channels = image_channels, channel_space=channel_space, time_emb_dim=128, dim_mults=dim_mults).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    model = UNet(img_start_channels = image_channels, channel_space=channel_space, dim_mults=dim_mults).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
+
+    if model_checkpoint:
+        model.load_state_dict(torch.load(model_checkpoint))
 
     # Initialize wandb project
     wandb.init(project='diffusion_testing')
 
+    # Keep track of training iterations
+    count = 0
     for epoch in range(epochs):
+        
+        # Before each epoch, make sure model is in training mode
+        model.train()
 
         # Initialize statistics to keep track of loss
         running_loss = 0
@@ -162,8 +191,8 @@ def main():
             # Apply noise to each image at each timestep with each gaussian noise
             noised_images = apply_noise(images, timesteps, noises)
 
-            # Cast inputs and targets to device
-            noised_images, noises = noised_images.to(device), noises.to(device)
+            # Cast inputs, targets, and timesteps to device
+            noised_images, noises, timesteps = map(lambda x: x.to(device), [noised_images, noises, timesteps])
 
             # Predict the noise used to noise each image
             predicted_noise = model(noised_images, timesteps)
@@ -176,20 +205,32 @@ def main():
             optimizer.zero_grad()   # Zero out gradients
             loss.backward()         # Send loss backwards (compute gradients)
             optimizer.step()        # Update model weights
-                
+            count += 1
+        
+        # Set model to evaluation mode before doing validation steps
+        model.eval()
+
         # Construct a grid of generated images to log and convert them to a wandb object
-        image_array = construct_image_grid(model, device, image_size, image_channels, 9)
-        images = wandb.Image(image_array, caption='Sampled images from diffusion model')
+        image_array = construct_image_grid(model, device, image_size, image_channels, n_log_images)
+        gen_images = wandb.Image(image_array, caption='Sampled images from diffusion model')
+
+        # Grab random samples from the training set and convert them into wandb image for logging
+        real_images = train_set[random.randint(0, len(train_set) - 1)][0]
+        image = reverse_transform(real_images).squeeze()
+        image = wandb.Image(Image.fromarray(image), caption="test")
 
         # Construct a gif of the diffusion process and turn it into a series of numpy images
         gif = reverse_transform(reverse_diff(model, device, image_size, image_channels))
 
         # Log all of the statistics to wandb
         wandb.log({'Loss': running_loss / len(train_loader),
-                    'Images': images,
+                    'Training Iters': count,
+                    'Generated Images': gen_images,
+                    'Real Images': image,
                     'Gif': wandb.Video(gif, fps=60, format='gif')})
 
-        torch.save(model.state_dict(), 'weights.pt')
+        # Save the model checkpoint somewhere
+        torch.save(model.state_dict(), 'checkpoints/weights_1.pt')
 
 
 if __name__ == "__main__":

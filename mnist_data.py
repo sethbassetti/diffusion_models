@@ -21,10 +21,15 @@ class MNISTDataset(Dataset):
         transform = transforms.RandomHorizontalFlip()
 
         # Loads the dataset, downloading if it is not already downloaded and converts it into pytorch
-        dataset = datasets.FashionMNIST('./data/', train=True, download=True).data
+        dataset = torch.tensor(datasets.FashionMNIST('./data/', train=True, download=True).data)
 
-        # N x H x W x C -> N x C x H x W
-        #dataset = dataset.permute(0, 3, 1, 2)
+        # If there is a channel dimension then reshape from N x H x W x C -> N x C x H x W
+        if len(dataset.shape) > 3:
+            dataset = dataset.permute(0, 3, 1, 2)
+        
+        # Otherwise add a channel dimension
+        else:
+            dataset = dataset.unsqueeze(1)
 
         # Converts images from [0, 255) integer scale to [0,1) float scale
         images = dataset / 255
@@ -33,7 +38,7 @@ class MNISTDataset(Dataset):
         images = images * 2 - 1
 
         # Adds a channel dimension to the images and applies the transform to them
-        images = transform(images.unsqueeze(1))
+        images = transform(images)
 
         return images
 
