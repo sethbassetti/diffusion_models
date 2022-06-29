@@ -22,6 +22,10 @@ class MNISTDataset(Dataset):
         images = dataset.data
         labels = dataset.targets
 
+        # If the images are not tensors, convert them and labels to tensors
+        if not torch.is_tensor(images):
+            map(lambda x: torch.tensor(x), [images, labels])
+
         # If there is a channel dimension then reshape from N x H x W x C -> N x C x H x W
         if len(images.shape) > 3:
             images = images.permute(0, 3, 1, 2)
