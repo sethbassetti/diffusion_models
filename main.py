@@ -1,28 +1,23 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, DistributedSampler
-from torchvision.utils import save_image, make_grid
-import matplotlib.pyplot as plt
-import torch.distributed as dist
-import torch.multiprocessing as mp
 import math
-
-import os
-
 import random
-from torch.nn.parallel import DistributedDataParallel as DDP
+
 import numpy as np
-
-from mnist_data import MNISTDataset
-from model import UNet
-
+import matplotlib.pyplot as plt
 import wandb
-from PIL import Image
 from tqdm import tqdm
 
+import torch
+from torch.utils.data import DataLoader
+from torchvision.utils import make_grid
+
+from mnist_data import MNISTDataset
+from diffusion import GaussianDiffusion
+from model import UNet
+
+
+
 # This is the amount of timesteps we can sample from
-T = 300
+T = 1000
 
 # A fixed hyperparameter for the cosine scheduler
 S = 0.008
@@ -41,19 +36,6 @@ def cosine_schedule(timesteps):
 
     return torch.clip(betas, 0.0001, 0.9999)
 
-
-
-# This is our variance schedule
-BETAS = linear_schedule(T)
-ALPHAS = 1 - BETAS                                              # See paper
-SQRT_RECIP_ALPHAS = 1.0 / torch.sqrt(ALPHAS)                    # Reciprocal of square root of alpha values                              
-ALPHA_CUMPROD = torch.cumprod(ALPHAS, dim=0)                    # Cumulative product of the alpha values
-ALPHA_CUMPROD_PREV = F.pad(ALPHA_CUMPROD[:-1],(1, 0),value=1.0) # Pads the last element with a 1
-SQRT_ALPHA_CUMPROD = torch.sqrt(ALPHA_CUMPROD)                  # Sqrt of the cumulative product of alpha values
-SQRT_ONE_MINUS_ALPHA_CUMPROD = torch.sqrt(1 - ALPHA_CUMPROD)    # Sqrt of one minus alpha cumprod values
-
-POSTERIOR_VARIANCE = BETAS * (1.0 - ALPHA_CUMPROD_PREV) / (1.0 - ALPHA_CUMPROD)
-
 def reverse_transform(image):
     """ Takes in a tensor image and converts it to a uint8 numpy array"""
 
@@ -63,61 +45,8 @@ def reverse_transform(image):
 
     return image
 
-def forward_diff(image, t, noise=None):
-    """ Given an image and a timestep (and optional noise), subjects the image to t levels of noising"""
-
-    # If noise is not given, then just initialize it to gaussian noise in the shape of the image
-    if noise is None:
-        noise = torch.randn_like(image)
-
-    sqrt_alpha_cumprod = extract(SQRT_ALPHA_CUMPROD, t, image.shape)
-    sqrt_one_minus_alpha_cumprod = extract(SQRT_ONE_MINUS_ALPHA_CUMPROD, t, image.shape)
-
-    # The new (noised) image will have a mean centered around the original image times the alpha value
-    mean = sqrt_alpha_cumprod * image
-
-    # The variance will be controlled by the multiplication of the beta schedules
-    variance = sqrt_one_minus_alpha_cumprod
-
-    # Push the gaussian distribution to center on our image with the appropriate variance
-    noised_image = noise * variance + mean
-
-    return noised_image
-
-
-def apply_noise(images, timesteps, noises):
-    """Takes in a batch of images, timesteps, and gaussian noises and uses the forward diffusion pass 
-    to apply noise to them"""
-
-    # Using each image, timestep, and noise in the batch run them through the forward diffusion pass to sample them
-    noised_images = [forward_diff(image, t, noise=noise) for image, t, noise in zip(images, timesteps, noises)]
-    
-    # Return a tensor of images, instead of a list
-    return torch.stack(noised_images)
-
-def p_sample(model, x, t, t_index):
-
-    # Extract each constant and reshape to shape of image
-    betas = extract(BETAS, t, x.shape)
-    sqrt_recip_alphas = extract(SQRT_RECIP_ALPHAS, t, x.shape)
-    sqrt_one_minus_alpha_cumprod = extract(SQRT_ONE_MINUS_ALPHA_CUMPROD, t, x.shape)
-
-    # Calculate the mean of the new img
-    model_mean = sqrt_recip_alphas * (x - (betas * model(x, t) / sqrt_one_minus_alpha_cumprod))
-
-    # If at the last timestep, just return mean without any noise
-    if t_index == 0:
-        return model_mean
-    else:
-        # Otherwise calculate posterior variance, random noise, and return that added to the predicted mean
-        posterior_variance = extract(POSTERIOR_VARIANCE, t, x.shape)
-        noise = torch.randn_like(x)
-
-        return model_mean + torch.sqrt(posterior_variance) * noise
-
-
 @torch.no_grad()
-def reverse_diff(model, shape):
+def reverse_diff(model, diffuser, shape):
     """Constructs a sequence of frames of the denoising process"""
     device = next(model.parameters()).device
 
@@ -132,10 +61,11 @@ def reverse_diff(model, shape):
     for i in tqdm(reversed(range(0, T)), desc='sampling loop time step', total=T):
 
         # Samples from the specific timestep
-        img = p_sample(model, img, torch.full((b,), i, device=device), i)
+        img = diffuser.p_sample(model, img, torch.full((b,), i, device=device), i)
         imgs.append(img.cpu())
 
     return imgs
+
 
 
 
@@ -160,30 +90,35 @@ def construct_image_grid(model, device, image_size, image_channels, num_imgs):
 
 
 def main():
+    train_model()
+
+def train_model():
 
     # Define Hyperparameters
     batch_size = 128
     epochs = 100
     lr = 2e-4
-    device = 1
+    device = 0
     channel_space = 64
 
     image_size = 28
     image_channels = 1
     dim_mults = (1, 2)
-
+    vartype = 'learned'
     n_log_images = 9        # How many images to log to wandb each epoch
 
     model_checkpoint = None
+
+    diffuser = GaussianDiffusion(linear_schedule(T), vartype, T)
 
     # Define the dataset and dataloader
     train_set = MNISTDataset()
     train_loader = DataLoader(train_set, batch_size=batch_size, num_workers=8, shuffle=True)
 
     # Define model, optimizer, and loss function
-    model = UNet(img_start_channels = image_channels, channel_space=channel_space, dim_mults=dim_mults).to(device)
+    model = UNet(img_start_channels = image_channels, channel_space=channel_space, dim_mults=dim_mults, 
+    vartype=vartype).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    criterion = nn.MSELoss()
 
     if model_checkpoint:
         model.load_state_dict(torch.load(model_checkpoint))
@@ -207,20 +142,9 @@ def main():
             # Cast image to device
             images = images.to(device)
 
-            # Define gaussian noise to be applied to this image
-            noises = torch.randn_like(images)
-
-            # Define a series of random timesteps to sample noise from
-            timesteps = torch.randint(0, T, (images.shape[0], ), device=device, dtype=torch.long)
-            
-            # Apply noise to each image at each timestep with each gaussian noise
-            noised_images = forward_diff(images, timesteps, noises)
-
-            # Predict epsilon, the noise used to noise each image
-            predicted_noise = model(noised_images, timesteps)
+            loss = diffuser.compute_losses(model, images, device)
 
             # Apply loss to each prediction and update count
-            loss = criterion(predicted_noise, noises)
             running_loss += loss.item()
 
             # Update model parameters
@@ -236,14 +160,11 @@ def main():
 
         # Grab random samples from the training set and convert them into wandb image for logging
         real_images = torch.stack([train_set[random.randint(0, len(train_set)-1)][0] for _ in range(n_log_images)])
-        #for i in range(n_log_images):
-            #real_images.append(train_set[random.randint(0, len(train_set) - 1)][0])
-        #real_images = torch.stack(real_images)
 
         real_img_grid = make_grid(real_images, nrow=3, normalize=True)
 
         # Generate a batch of images
-        gen_imgs = reverse_diff(model, (n_log_images, image_channels, image_size, image_size))
+        gen_imgs = reverse_diff(model, diffuser, (n_log_images, image_channels, image_size, image_size))
 
         # Make the last (t=0) slice of images into a grid
         gen_img_grid = make_grid(gen_imgs[-1], nrow=3, normalize=True)

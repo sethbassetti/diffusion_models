@@ -132,13 +132,16 @@ class WideResBlock(nn.Module):
 class UNet(nn.Module):
 
 
-    def __init__(self, img_start_channels=1, channel_space=64, dim_mults=(1, 2, 2, 2)):
+    def __init__(self, img_start_channels=1, channel_space=64, dim_mults=(1, 2, 2, 2), vartype="fixed"):
         super().__init__()
 
 
         self.channel_space = channel_space
         self.time_dim = channel_space * 4
         self.start_channels = img_start_channels
+
+        # If variance is learned, double output channels so half are mean and half are variance
+        self.out_channels = img_start_channels * 2 if vartype == "learned" else img_start_channels
         self.dim_mults = dim_mults
 
         self.time_linear = nn.Sequential(nn.Linear(self.channel_space, self.time_dim),
@@ -164,7 +167,7 @@ class UNet(nn.Module):
 
         # Output convolutional block that returns image to original channel dim
         self.output_conv = nn.Sequential(WideResBlock(self.channel_space, self.channel_space),
-                                         nn.Conv2d(self.channel_space, self.start_channels, kernel_size=1))
+                                         nn.Conv2d(self.channel_space, self.out_channels, kernel_size=1))
         
 
     def build_contrastives(self):
