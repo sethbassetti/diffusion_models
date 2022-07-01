@@ -23,17 +23,25 @@ T = 4000
 S = 0.008
 
 def linear_schedule(timesteps):
-    return torch.linspace(0.0001, 0.02, timesteps)
+
+    # Scale beta start and end to work with any number of timesteps
+    scale = 1000.0 / timesteps
+    beta_start = 0.0001 * scale
+    beta_end = 0.02 * scale
+
+    return torch.linspace(beta_start, beta_end, timesteps)
 
 def cosine_schedule(timesteps):
 
-    steps = timesteps + 1
-    x = torch.linspace(0, timesteps, steps)
+    # The cosine schedule formula
+    formula = lambda t: math.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2
+    betas = []
+    for i in range(timesteps):
+        t1 = i / timesteps
+        t2 = (i + 1) / timesteps
+        betas.append(1-formula(t2) / formula(t1))
 
-    alphas_cumprod = torch.cos(((x / timesteps) + S) / (1 + S) * torch.pi * 0.5) ** 2
-    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-
+    betas = torch.tensor(betas)
     return torch.clip(betas, 0.0001, 0.9999)
 
 def reverse_transform(image):
