@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 
 from losses import normal_kl, discretized_gaussian_log_likelihood
+from model import WrappedModel
 
 LAMBDA = 0.001
 
@@ -32,7 +33,7 @@ def extract(a, t, x_shape):
 
 class GaussianDiffusion:
     """This class is given a variance schedule and handles all operations related to forward or reverse diffusion"""
-    def __init__(self, betas, vartype, T):
+    def __init__(self, betas, vartype, T, sampling_steps = None):
 
         self.vartype = vartype  # Whether variance is fixed or learned
         self.T = T              # Number of timesteps in diffusion process
@@ -41,9 +42,9 @@ class GaussianDiffusion:
 
         # This calculates all of the constants necessary for the diffusion operations
         self.construct_constants(betas)
-        t = torch.tensor([1, 5, 7, 9])
-        shape = (4, 1, 28, 28)
-        extract(self.betas, t, shape)
+
+        if sampling_steps:
+            self.space_betas(sampling_steps)
 
     def construct_constants(self, betas):
         """Calculates all of the beta/alpha/sqrt constants that are needed for forward and reverse diffusion"""
@@ -61,7 +62,31 @@ class GaussianDiffusion:
         # Used for posterior variance calculations
         self.posterior_variance = (1 - self.alpha_cumprods_prev) * self.betas / (1 - self.alpha_cumprods)
         self.posterior_log_variance_clipped = torch.log(torch.cat([self.posterior_variance[1].unsqueeze(0), self.posterior_variance[1:]]))
+
+    def space_betas(self, timesteps):
+        """ Re-calculates all of the constants in the class to use a subset, S of total timesteps T.
+        This allows for sampling with fewer timesteps based on a reduced variance schedule
+
+        Args:
+            timesteps (list[int]): A list of integers of which timesteps we will be sampling from
+        """
+        # Define empty beta list and starting alpha cumulative product value
+        new_betas = []
+        self.timestep_map = []
+        last_alpha_cumprod = 1.0
+
+        # Iterate over each value in the alpha cumulative products
+        for i, alpha_cumprod in enumerate(self.alpha_cumprods):
+            if i in timesteps:
+                new_betas.append(1 - alpha_cumprod / last_alpha_cumprod)
+                last_alpha_cumprod = alpha_cumprod
+                self.timestep_map.append(i)
         
+        self.construct_constants(torch.tensor(new_betas))
+
+    def wrap_model(self, model):
+        """ Wrap the model so that it converts from subsequence S samplings steps to original T"""
+        return WrappedModel(model, self.timestep_map, self.T)
 
     def forward_diffuse(self, images, t, noise=None):
         """Samples from a forward diffusion process at specified timesteps.

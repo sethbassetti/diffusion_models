@@ -17,7 +17,7 @@ from model import UNet
 
 
 # This is the amount of timesteps we can sample from
-T = 1000
+T = 4000
 
 # A fixed hyperparameter for the cosine scheduler
 S = 0.008
@@ -46,8 +46,9 @@ def reverse_transform(image):
     return image
 
 @torch.no_grad()
-def reverse_diff(model, diffuser, shape):
+def reverse_diff(model, diffuser, sampling_steps, shape):
     """Constructs a sequence of frames of the denoising process"""
+
     device = next(model.parameters()).device
 
     b = shape[0]
@@ -56,9 +57,15 @@ def reverse_diff(model, diffuser, shape):
     img = torch.randn(shape, device=device)
 
     imgs = []
-    
+
+    # Construct an even sampling range between 0 and T according to n_sampling_steps
+    sampling_range = range(0, sampling_steps)
+
+    # Wrap the model so that it converts timesteps from S to timesteps from original T sequence
+    model = diffuser.wrap_model(model)
+
     # Loops through each timestep to get to the generated image
-    for i in tqdm(reversed(range(0, T)), desc='sampling loop time step', total=T):
+    for i in tqdm(reversed(sampling_range), desc='sampling loop time step', total=sampling_steps):
 
         # Samples from the specific timestep
         img = diffuser.p_sample(model, img, torch.full((b,), i, device=device), i)
@@ -106,10 +113,13 @@ def train_model():
     dim_mults = (1, 2)
     vartype = 'learned'
     n_log_images = 9        # How many images to log to wandb each epoch
+    sampling_steps = 1000
 
     model_checkpoint = None
 
-    diffuser = GaussianDiffusion(linear_schedule(T), vartype, T)
+    # Define a diffusion process for training and one for sampling
+    train_diffuser = GaussianDiffusion(cosine_schedule(T), vartype, T)
+    sampler_diffuser = GaussianDiffusion(cosine_schedule(T), vartype, T, sampling_steps=list(range(0, T, T // sampling_steps)))
 
     # Define the dataset and dataloader
     train_set = MNISTDataset()
@@ -142,7 +152,7 @@ def train_model():
             # Cast image to device
             images = images.to(device)
 
-            loss = diffuser.compute_losses(model, images, device)
+            loss = train_diffuser.compute_losses(model, images, device)
 
             # Apply loss to each prediction and update count
             running_loss += loss.item()
@@ -164,7 +174,7 @@ def train_model():
         real_img_grid = make_grid(real_images, nrow=3, normalize=True)
 
         # Generate a batch of images
-        gen_imgs = reverse_diff(model, diffuser, (n_log_images, image_channels, image_size, image_size))
+        gen_imgs = reverse_diff(model, sampler_diffuser, sampling_steps, (n_log_images, image_channels, image_size, image_size))
 
         # Make the last (t=0) slice of images into a grid
         gen_img_grid = make_grid(gen_imgs[-1], nrow=3, normalize=True)

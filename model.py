@@ -2,6 +2,22 @@ import torch.nn as nn
 import math
 import torch
 
+class WrappedModel:
+    """A wrapper around a model that allows for fast sampling using fewer timesteps. Converts from indices in the range
+    [0, S] to corresponding original indices from [0, T]"""
+    def __init__(self, model, timestep_map, original_num_steps):
+        self.model = model
+        self.timestep_map = timestep_map
+
+        self.original_num_steps = original_num_steps
+
+    def __call__(self, x, ts, **kwargs):
+        """Whenever the model is called, create a map tensor that maps S_i to T_j. Then convert all timesteps
+        accordingly before sending t into the model"""
+        map_tensor = torch.tensor(self.timestep_map, device=ts.device, dtype=ts.dtype)
+        new_ts = map_tensor[ts]
+        return self.model(x, new_ts, **kwargs)
+
 class Attention(nn.Module):
     def __init__(self, dim, heads=4, dim_head=32):
         super().__init__()
