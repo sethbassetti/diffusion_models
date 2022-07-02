@@ -18,13 +18,13 @@ class MNISTDataset(Dataset):
         transform = transforms.RandomHorizontalFlip()
 
         # Loads the dataset, downloading if it is not already downloaded and converts it into pytorch
-        dataset = datasets.FashionMNIST('./data/', train=True, download=True)
+        dataset = datasets.CIFAR10('./data/', train=True, download=True)
         images = dataset.data
         labels = dataset.targets
 
         # If the images are not tensors, convert them and labels to tensors
         if not torch.is_tensor(images):
-            map(lambda x: torch.tensor(x), [images, labels])
+            images, labels = map(lambda x: torch.tensor(x), [images, labels])
 
         # If there is a channel dimension then reshape from N x H x W x C -> N x C x H x W
         if len(images.shape) > 3:

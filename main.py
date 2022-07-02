@@ -1,5 +1,6 @@
 import math
 import random
+import os
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -8,7 +9,12 @@ from tqdm import tqdm
 
 import torch
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torchvision.utils import make_grid
+import torch.multiprocessing as mp
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 
 from mnist_data import MNISTDataset
 from diffusion import GaussianDiffusion
@@ -105,20 +111,36 @@ def construct_image_grid(model, device, image_size, image_channels, num_imgs):
 
 
 def main():
-    train_model()
+    world_size = 4
+    if world_size > 1:
+        os.environ["MASTER_ADDR"] = 'localhost'
+        os.environ["MASTER_PORT"] = "29500"
+        mp.spawn(setup,
+                args=(world_size, ),
+                nprocs=world_size,
+                join=True)
+    else:
+        # If world size is 1, set rank to first device and call function normally
+        rank = 0
+        train_model(rank, world_size)
 
-def train_model():
+def setup(rank, world_size):
+    dist.init_process_group('nccl', rank=rank, world_size=world_size)
+    train_model(rank, world_size)
+
+
+def train_model(rank, world_size):
 
     # Define Hyperparameters
     batch_size = 128
     epochs = 100
     lr = 2e-4
-    device = 0
-    channel_space = 64
+    device = rank
+    channel_space = 128
 
-    image_size = 28
-    image_channels = 1
-    dim_mults = (1, 2)
+    image_size = 32
+    image_channels = 3
+    dim_mults = (1, 2, 2, 2)
     vartype = 'learned'
     n_log_images = 9        # How many images to log to wandb each epoch
     sampling_steps = 1000
@@ -126,23 +148,33 @@ def train_model():
     model_checkpoint = None
 
     # Define a diffusion process for training and one for sampling
-    train_diffuser = GaussianDiffusion(cosine_schedule(T), vartype, T)
-    sampler_diffuser = GaussianDiffusion(cosine_schedule(T), vartype, T, sampling_steps=list(range(0, T, T // sampling_steps)))
+    train_diffuser = GaussianDiffusion(linear_schedule(T), vartype, T)
+    sampler_diffuser = GaussianDiffusion(linear_schedule(T), vartype, T, sampling_steps=list(range(0, T, T // sampling_steps)))
 
-    # Define the dataset and dataloader
+    # Define the dataset
     train_set = MNISTDataset()
-    train_loader = DataLoader(train_set, batch_size=batch_size, num_workers=8, shuffle=True)
+
+    # If the world size is greater than 1, initialize a distributed sampler to split dataset up
+    sampler = None if world_size <= 1 else DistributedSampler(train_set, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
+    train_loader = DataLoader(train_set, batch_size=batch_size, num_workers=8, sampler=sampler)
 
     # Define model, optimizer, and loss function
     model = UNet(img_start_channels = image_channels, channel_space=channel_space, dim_mults=dim_mults, 
     vartype=vartype).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
+    # If there is a model checkpoint set, then load weights from that model
     if model_checkpoint:
         model.load_state_dict(torch.load(model_checkpoint))
 
-    # Initialize wandb project
-    wandb.init(project='diffusion_testing', settings=wandb.Settings(start_method='fork'))
+
+    if world_size > 1:
+        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+
+
+    # Initialize wandb project if we are at first rank
+    if rank == 0 or world_size == 1:
+        wandb.init(project='diffusion_testing', settings=wandb.Settings(start_method='fork'))
 
     # Keep track of training iterations
     count = 0
@@ -154,8 +186,11 @@ def train_model():
         # Initialize statistics to keep track of loss
         running_loss = 0
 
+        # If rank is 0 then apply tqdm progress bar to this
+        train_loader = tqdm(train_loader, desc=f'Epoch {epoch}') if rank == 0 else train_loader
+
         # Iterate over batch of images and random timesteps
-        for images, _ in tqdm(train_loader, desc=f'Epoch {epoch}'):
+        for images, _ in train_loader:
             
             # Cast image to device
             images = images.to(device)
@@ -171,34 +206,37 @@ def train_model():
             optimizer.step()        # Update model weights
             count += 1              # Keep track of num of updates
         
-        # Set model to evaluation mode before doing validation steps
-        model.eval()
 
-       
+        # If rank is 0 then evaluate model
+        if rank == 0:
+            # Set model to evaluation mode before doing validation steps
+            model.eval()
 
-        # Grab random samples from the training set and convert them into wandb image for logging
-        real_images = torch.stack([train_set[random.randint(0, len(train_set)-1)][0] for _ in range(n_log_images)])
+        
 
-        real_img_grid = make_grid(real_images, nrow=3, normalize=True)
+            # Grab random samples from the training set and convert them into wandb image for logging
+            real_images = torch.stack([train_set[random.randint(0, len(train_set)-1)][0] for _ in range(n_log_images)])
 
-        # Generate a batch of images
-        gen_imgs = reverse_diff(model, sampler_diffuser, sampling_steps, (n_log_images, image_channels, image_size, image_size))
+            real_img_grid = make_grid(real_images, nrow=3, normalize=True)
 
-        # Make the last (t=0) slice of images into a grid
-        gen_img_grid = make_grid(gen_imgs[-1], nrow=3, normalize=True)
+            # Generate a batch of images
+            gen_imgs = reverse_diff(model, sampler_diffuser, sampling_steps, (n_log_images, image_channels, image_size, image_size))
 
-        # Take all of the frames from the reverse diffusion process for an image and convert it into numpy array
-        gif = reverse_transform(torch.stack(gen_imgs)[:,0])
+            # Make the last (t=0) slice of images into a grid
+            gen_img_grid = make_grid(gen_imgs[-1], nrow=3, normalize=True)
 
-        # Log all of the statistics to wandb
-        wandb.log({'Loss': running_loss / len(train_loader),
-                    'Training Iters': count,
-                    'Generated Images': wandb.Image(gen_img_grid, caption="Generated Images"),
-                    'Real Images': wandb.Image(real_img_grid, caption='Real Images'),
-                    'Gif': wandb.Video(gif, fps=60, format='gif')})
+            # Take all of the frames from the reverse diffusion process for an image and convert it into numpy array
+            gif = reverse_transform(torch.stack(gen_imgs)[:,0])
 
-        # Save the model checkpoint somewhere
-        torch.save(model.state_dict(), 'checkpoints/weights_1.pt')
+            # Log all of the statistics to wandb
+            wandb.log({'Loss': running_loss / len(train_loader),
+                        'Training Iters': count * 4,
+                        'Generated Images': wandb.Image(gen_img_grid, caption="Generated Images"),
+                        'Real Images': wandb.Image(real_img_grid, caption='Real Images'),
+                        'Gif': wandb.Video(gif, fps=60, format='gif')})
+
+            # Save the model checkpoint somewhere
+            #torch.save(model.state_dict(), 'checkpoints/weights_1.pt')
 
 
 if __name__ == "__main__":

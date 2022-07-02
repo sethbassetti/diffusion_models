@@ -118,7 +118,7 @@ class WideResBlock(nn.Module):
     """ The main building block of the UNet Architecture. Uses residual connections and sends x through
     two convolutional blocks, along with inserting the time embedding into it"""
 
-    def __init__(self, in_channels, out_channels, time_emb_dim=256, dropout=0.1):
+    def __init__(self, in_channels, out_channels, time_emb_dim=512, dropout=0.1):
         super().__init__()
 
         # Main building block, increasing channel size
