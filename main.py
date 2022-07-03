@@ -113,8 +113,7 @@ def construct_image_grid(model, device, image_size, image_channels, num_imgs):
 def main():
     world_size = 4
     if world_size > 1:
-        os.environ["MASTER_ADDR"] = 'localhost'
-        os.environ["MASTER_PORT"] = "29500"
+        
         mp.spawn(setup,
                 args=(world_size, ),
                 nprocs=world_size,
@@ -125,6 +124,8 @@ def main():
         train_model(rank, world_size)
 
 def setup(rank, world_size):
+    os.environ["MASTER_ADDR"] = 'localhost'
+    os.environ["MASTER_PORT"] = "29500"
     dist.init_process_group('nccl', rank=rank, world_size=world_size)
     train_model(rank, world_size)
 
@@ -155,7 +156,7 @@ def train_model(rank, world_size):
     train_set = MNISTDataset()
 
     # If the world size is greater than 1, initialize a distributed sampler to split dataset up
-    sampler = None if world_size <= 1 else DistributedSampler(train_set, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
+    sampler = None if world_size <= 1 else DistributedSampler(train_set, shuffle=True)
     train_loader = DataLoader(train_set, batch_size=batch_size, num_workers=8, sampler=sampler)
 
     # Define model, optimizer, and loss function
@@ -180,6 +181,8 @@ def train_model(rank, world_size):
     count = 0
     for epoch in range(epochs):
         
+
+        train_loader.sampler.set_epoch(epoch)
         # Before each epoch, make sure model is in training mode
         model.train()
 
@@ -187,10 +190,11 @@ def train_model(rank, world_size):
         running_loss = 0
 
         # If rank is 0 then apply tqdm progress bar to this
-        train_loader = tqdm(train_loader, desc=f'Epoch {epoch}') if rank == 0 else train_loader
+        tqdm_train_loader = tqdm(train_loader, desc=f'Epoch {epoch}') if rank == 0 else train_loader
 
         # Iterate over batch of images and random timesteps
-        for images, _ in train_loader:
+        for images, _ in tqdm_train_loader:
+            
             
             # Cast image to device
             images = images.to(device)
