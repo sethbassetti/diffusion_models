@@ -256,7 +256,7 @@ class GaussianDiffusion:
         
         # Apply noise to each image at each timestep with each gaussian noise
         noised_images = self.forward_diffuse(images, timesteps, noises)
-
+        
         # Predict epsilon, the noise used to noise each image
         model_output = model(noised_images, timesteps)
     

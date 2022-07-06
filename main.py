@@ -8,6 +8,7 @@ import wandb
 from tqdm import tqdm
 
 import torch
+from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.utils import make_grid
@@ -17,6 +18,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 from mnist_data import MNISTDataset
+from celeb_data import CelebDataset
 from diffusion import GaussianDiffusion
 from model import UNet
 
@@ -50,12 +52,19 @@ def cosine_schedule(timesteps):
     betas = torch.tensor(betas)
     return torch.clip(betas, 0.0001, 0.9999)
 
-def reverse_transform(image):
+def reverse_transform(image, switch_dims=True):
     """ Takes in a tensor image and converts it to a uint8 numpy array"""
 
     image = (image + 1) / 2                 # Range [-1, 1] -> [0, 1)
     image *= 255                            # Range [0, 1) -> [0, 255)
+    if switch_dims:
+        if len(image.shape) == 3:
+            image = image.permute(1, 2, 0)
+        elif len(image.shape) == 4:
+            image = image.permute(0, 2, 3, 1)
+
     image = image.numpy().astype(np.uint8)  # Cast image to numpy and make it an unsigned integer type (no negatives)
+
 
     return image
 
@@ -125,7 +134,7 @@ def main():
 
 def setup(rank, world_size):
     os.environ["MASTER_ADDR"] = 'localhost'
-    os.environ["MASTER_PORT"] = "29500"
+    os.environ["MASTER_PORT"] = "12345"
     dist.init_process_group('nccl', rank=rank, world_size=world_size)
     train_model(rank, world_size)
 
@@ -133,20 +142,23 @@ def setup(rank, world_size):
 def train_model(rank, world_size):
 
     # Define Hyperparameters
-    batch_size = 128
+    batch_size = 64
+    grad_iters = 2
     epochs = 100
-    lr = 2e-4
+    lr = 3e-4
     device = rank
     channel_space = 128
 
-    image_size = 32
+    image_size = 64
     image_channels = 3
     dim_mults = (1, 2, 2, 2)
+    attn_resos = (2, 4, 8)
     vartype = 'learned'
     n_log_images = 9        # How many images to log to wandb each epoch
     sampling_steps = 1000
 
     model_checkpoint = None
+    data_path = "/home/bassets/diffusion_models/data/celebHQ/"
 
     # Define a diffusion process for training and one for sampling
     train_diffuser = GaussianDiffusion(linear_schedule(T), vartype, T)
@@ -161,9 +173,9 @@ def train_model(rank, world_size):
 
     # Define model, optimizer, and loss function
     model = UNet(img_start_channels = image_channels, channel_space=channel_space, dim_mults=dim_mults, 
-    vartype=vartype).to(device)
+    vartype=vartype, attn_resolutions=attn_resos).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-
+    scaler = GradScaler()
     # If there is a model checkpoint set, then load weights from that model
     if model_checkpoint:
         model.load_state_dict(torch.load(model_checkpoint))
@@ -177,12 +189,13 @@ def train_model(rank, world_size):
     if rank == 0 or world_size == 1:
         wandb.init(project='diffusion_testing', settings=wandb.Settings(start_method='fork'))
 
+
     # Keep track of training iterations
     count = 0
     for epoch in range(epochs):
         
 
-        train_loader.sampler.set_epoch(epoch)
+        #train_loader.sampler.set_epoch(epoch)
         # Before each epoch, make sure model is in training mode
         model.train()
 
@@ -191,53 +204,65 @@ def train_model(rank, world_size):
 
         # If rank is 0 then apply tqdm progress bar to this
         tqdm_train_loader = tqdm(train_loader, desc=f'Epoch {epoch}') if rank == 0 else train_loader
+        
+        # Zero out the gradients before starting batch
+        optimizer.zero_grad()
 
         # Iterate over batch of images and random timesteps
-        for images, _ in tqdm_train_loader:
+        for batch_idx, images in enumerate(tqdm_train_loader):
             
             
             # Cast image to device
             images = images.to(device)
 
-            loss = train_diffuser.compute_losses(model, images, device)
+            # Use automatic mixed precision for loss calculation
+            with autocast():
+                loss = train_diffuser.compute_losses(model, images, device)
 
-            # Apply loss to each prediction and update count
-            running_loss += loss.item()
+                # Apply loss to each prediction and update count
+                running_loss += loss.item()
 
-            # Update model parameters
-            optimizer.zero_grad()   # Zero out gradients
-            loss.backward()         # Send loss backwards (compute gradients)
-            optimizer.step()        # Update model weights
-            count += 1              # Keep track of num of updates
-        
+                # Update model parameters
+                loss = loss / grad_iters
+
+            # Scale the l
+            scaler.scale(loss).backward()         # Send loss backwards (compute gradients)
+
+            # Perform gradient accumulation so only update gradients every few batches (8)
+            if (batch_idx + 1) % grad_iters == 0:
+                scaler.step(optimizer)    # Update model 
+                scaler.update()
+                count += 1              # Keep track of num of updates
+                optimizer.zero_grad()   # Zero out gradients
 
         # If rank is 0 then evaluate model
         if rank == 0:
             # Set model to evaluation mode before doing validation steps
             model.eval()
 
-        
-
             # Grab random samples from the training set and convert them into wandb image for logging
-            real_images = torch.stack([train_set[random.randint(0, len(train_set)-1)][0] for _ in range(n_log_images)])
+            real_images = torch.stack([train_set[random.randint(0, len(train_set)-1)]for _ in range(n_log_images)])
 
-            real_img_grid = make_grid(real_images, nrow=3, normalize=True)
+            real_img_grid = make_grid(real_images, nrow=3)
 
             # Generate a batch of images
             gen_imgs = reverse_diff(model, sampler_diffuser, sampling_steps, (n_log_images, image_channels, image_size, image_size))
 
             # Make the last (t=0) slice of images into a grid
-            gen_img_grid = make_grid(gen_imgs[-1], nrow=3, normalize=True)
+            gen_img_grid = make_grid(gen_imgs[-1], nrow=3)
 
             # Take all of the frames from the reverse diffusion process for an image and convert it into numpy array
-            gif = reverse_transform(torch.stack(gen_imgs)[:,0])
-
+            gif = reverse_transform(torch.stack(gen_imgs)[:, 0], switch_dims=False)
+            print("Bout to log")
+            print(gif.shape)
             # Log all of the statistics to wandb
             wandb.log({'Loss': running_loss / len(train_loader),
                         'Training Iters': count * 4,
-                        'Generated Images': wandb.Image(gen_img_grid, caption="Generated Images"),
-                        'Real Images': wandb.Image(real_img_grid, caption='Real Images'),
+                        'Generated Images': wandb.Image(reverse_transform(gen_img_grid), caption="Generated Images"),
+                        'Real Images': wandb.Image(reverse_transform(real_img_grid), caption='Real Images'),
                         'Gif': wandb.Video(gif, fps=60, format='gif')})
+
+            print("Logged")
 
             # Save the model checkpoint somewhere
             #torch.save(model.state_dict(), 'checkpoints/weights_1.pt')

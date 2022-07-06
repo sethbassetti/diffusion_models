@@ -1,8 +1,8 @@
 from abc import abstractmethod
+import math
 
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 import torch
 
 def zero_module(module):

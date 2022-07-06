@@ -51,7 +51,7 @@ class MNISTDataset(Dataset):
         image = self.images[idx]
         label = self.labels[idx]
 
-        return image, label
+        return image
 
     def __len__(self):
         return len(self.images)
