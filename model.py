@@ -225,11 +225,12 @@ class UNet(nn.Module):
 
 
     def __init__(self, img_start_channels=1, channel_space=64, dim_mults=(1, 2, 2, 2), vartype="fixed",
-    blocks_per_res=2, attn_resolutions=(2, 4, 8)):
+    blocks_per_res=2, attn_resolutions=(2, 4, 8), dropout=0.1):
         super().__init__()
 
         self.attn_resolutions = attn_resolutions
         self.blocks_per_res = blocks_per_res
+        self.dropout = dropout
         self.channel_space = channel_space
         self.time_dim = channel_space * 4
         self.start_channels = img_start_channels
@@ -248,9 +249,9 @@ class UNet(nn.Module):
         bottleneck_depth = self.dim_mults[-1] * channel_space
         
         # Defines the two bottleneck layers and converts it into a sequential model
-        self.bottleneck_1 = WideResBlock(bottleneck_depth, bottleneck_depth, time_emb_dim=self.time_dim)
+        self.bottleneck_1 = WideResBlock(bottleneck_depth, bottleneck_depth, time_emb_dim=self.time_dim, dropout=self.dropout)
         self.mid_attn = Residual(PreNorm(bottleneck_depth, Attention(bottleneck_depth)))
-        self.bottleneck_2 = WideResBlock(bottleneck_depth, bottleneck_depth, time_emb_dim=self.time_dim)
+        self.bottleneck_2 = WideResBlock(bottleneck_depth, bottleneck_depth, time_emb_dim=self.time_dim, dropout=self.dropout)
 
         # Builds the series of expansive blocks leading to the output
         self.expansives = self.build_expansives(res_channels)
@@ -280,7 +281,7 @@ class UNet(nn.Module):
             for _ in range(self.blocks_per_res):
             
                 # Define the wide resnet blocks that comprise each layer
-                layers = [WideResBlock(ch, scale * self.channel_space, time_emb_dim=self.time_dim)]
+                layers = [WideResBlock(ch, scale * self.channel_space, time_emb_dim=self.time_dim, dropout=self.dropout)]
                 ch = scale * self.channel_space
 
                 # If we are at an appropriate downscale, add an attention block
@@ -295,7 +296,7 @@ class UNet(nn.Module):
 
                 out_ch = ch
                 # Add a downscale operation
-                self.input_blocks.append(TimestepEmbedSequential(WideResBlock(ch, out_ch, time_emb_dim=self.time_dim, down=True)))
+                self.input_blocks.append(TimestepEmbedSequential(WideResBlock(ch, out_ch, time_emb_dim=self.time_dim, down=True, dropout=self.dropout)))
 
                 ch = out_ch
                 res_channels.append(ch)
@@ -318,7 +319,7 @@ class UNet(nn.Module):
 
                 in_res_channels = res_channels.pop()
 
-                layers = [WideResBlock(ch + in_res_channels, self.channel_space * scale, time_emb_dim=self.time_dim)]
+                layers = [WideResBlock(ch + in_res_channels, self.channel_space * scale, time_emb_dim=self.time_dim, dropout=self.dropout)]
                 ch = scale * self.channel_space
 
                 if downscale in self.attn_resolutions:
@@ -326,7 +327,7 @@ class UNet(nn.Module):
                 
                 if level and i == self.blocks_per_res:
                     out_ch = ch
-                    layers.append(WideResBlock(ch, out_ch, time_emb_dim=self.time_dim, up=True))
+                    layers.append(WideResBlock(ch, out_ch, time_emb_dim=self.time_dim, up=True, dropout=self.dropout))
                     downscale //= 2
 
                 # Create a block that holds the convolutional block and the upsampling operation

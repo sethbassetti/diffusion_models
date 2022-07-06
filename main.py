@@ -142,17 +142,18 @@ def setup(rank, world_size):
 def train_model(rank, world_size):
 
     # Define Hyperparameters
-    batch_size = 64
-    grad_iters = 2
+    batch_size = 32
+    grad_iters = 4
     epochs = 100
     lr = 3e-4
     device = rank
     channel_space = 128
 
-    image_size = 64
+    image_size = 32
     image_channels = 3
     dim_mults = (1, 2, 2, 2)
     attn_resos = (2, 4, 8)
+    dropout=0.3
     vartype = 'learned'
     n_log_images = 9        # How many images to log to wandb each epoch
     sampling_steps = 1000
@@ -161,8 +162,8 @@ def train_model(rank, world_size):
     data_path = "/home/bassets/diffusion_models/data/celebHQ/"
 
     # Define a diffusion process for training and one for sampling
-    train_diffuser = GaussianDiffusion(linear_schedule(T), vartype, T)
-    sampler_diffuser = GaussianDiffusion(linear_schedule(T), vartype, T, sampling_steps=list(range(0, T, T // sampling_steps)))
+    train_diffuser = GaussianDiffusion(cosine_schedule(T), vartype, T)
+    sampler_diffuser = GaussianDiffusion(cosine_schedule(T), vartype, T, sampling_steps=list(range(0, T, T // sampling_steps)))
 
     # Define the dataset
     train_set = MNISTDataset()
@@ -173,7 +174,7 @@ def train_model(rank, world_size):
 
     # Define model, optimizer, and loss function
     model = UNet(img_start_channels = image_channels, channel_space=channel_space, dim_mults=dim_mults, 
-    vartype=vartype, attn_resolutions=attn_resos).to(device)
+    vartype=vartype, attn_resolutions=attn_resos, dropout=dropout).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     scaler = GradScaler()
     # If there is a model checkpoint set, then load weights from that model
@@ -253,16 +254,13 @@ def train_model(rank, world_size):
 
             # Take all of the frames from the reverse diffusion process for an image and convert it into numpy array
             gif = reverse_transform(torch.stack(gen_imgs)[:, 0], switch_dims=False)
-            print("Bout to log")
-            print(gif.shape)
+
             # Log all of the statistics to wandb
             wandb.log({'Loss': running_loss / len(train_loader),
                         'Training Iters': count * 4,
                         'Generated Images': wandb.Image(reverse_transform(gen_img_grid), caption="Generated Images"),
                         'Real Images': wandb.Image(reverse_transform(real_img_grid), caption='Real Images'),
                         'Gif': wandb.Video(gif, fps=60, format='gif')})
-
-            print("Logged")
 
             # Save the model checkpoint somewhere
             #torch.save(model.state_dict(), 'checkpoints/weights_1.pt')
