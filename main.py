@@ -57,12 +57,9 @@ def reverse_transform(image, switch_dims=True):
 
     image = (image + 1) / 2                 # Range [-1, 1] -> [0, 1)
     image *= 255                            # Range [0, 1) -> [0, 255)
-    if switch_dims:
-        if len(image.shape) == 3:
-            image = image.permute(1, 2, 0)
-        elif len(image.shape) == 4:
-            image = image.permute(0, 2, 3, 1)
 
+    if len(image.shape) == 3:
+        image = image.permute(1, 2, 0)
     image = image.numpy().astype(np.uint8)  # Cast image to numpy and make it an unsigned integer type (no negatives)
 
 
@@ -209,6 +206,8 @@ def train_model(rank, world_size):
         # Zero out the gradients before starting batch
         optimizer.zero_grad()
 
+        optimizer.zero_grad()
+
         # Iterate over batch of images and random timesteps
         for batch_idx, images in enumerate(tqdm_train_loader):
             
@@ -223,18 +222,16 @@ def train_model(rank, world_size):
                 # Apply loss to each prediction and update count
                 running_loss += loss.item()
 
-                # Update model parameters
-                loss = loss / grad_iters
+            loss = loss / grad_iters
 
-            # Scale the l
-            scaler.scale(loss).backward()         # Send loss backwards (compute gradients)
+            # Update model parameters
+            loss.backward()         # Send loss backwards (compute gradients)
 
-            # Perform gradient accumulation so only update gradients every few batches (8)
             if (batch_idx + 1) % grad_iters == 0:
-                scaler.step(optimizer)    # Update model 
-                scaler.update()
+                optimizer.step()        # Update model weights
                 count += 1              # Keep track of num of updates
-                optimizer.zero_grad()   # Zero out gradients
+                optimizer.zero_grad()
+        
 
         # If rank is 0 then evaluate model
         if rank == 0:
@@ -242,7 +239,7 @@ def train_model(rank, world_size):
             model.eval()
 
             # Grab random samples from the training set and convert them into wandb image for logging
-            real_images = torch.stack([train_set[random.randint(0, len(train_set)-1)]for _ in range(n_log_images)])
+            real_images = torch.stack([train_set[random.randint(0, len(train_set)-1)] for _ in range(n_log_images)])
 
             real_img_grid = make_grid(real_images, nrow=3)
 
@@ -258,8 +255,8 @@ def train_model(rank, world_size):
             # Log all of the statistics to wandb
             wandb.log({'Loss': running_loss / len(train_loader),
                         'Training Iters': count * 4,
-                        'Generated Images': wandb.Image(gen_img_grid, caption="Generated Images"),
-                        'Real Images': wandb.Image(reverse_transform(real_img_grid), caption='Real Images'),
+                        'Generated Images': wandb.Image(reverse_transform(gen_img_grid), caption="Generated Images"),
+                        'Real Images': wandb.Image(real_img_grid, caption='Real Images'),
                         'Gif': wandb.Video(gif, fps=60, format='gif')})
 
             # Save the model checkpoint somewhere
