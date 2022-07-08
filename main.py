@@ -258,7 +258,7 @@ def train_model(rank, world_size):
             # Log all of the statistics to wandb
             wandb.log({'Loss': running_loss / len(train_loader),
                         'Training Iters': count * 4,
-                        'Generated Images': wandb.Image(reverse_transform(gen_img_grid), caption="Generated Images"),
+                        'Generated Images': wandb.Image(gen_img_grid, caption="Generated Images"),
                         'Real Images': wandb.Image(reverse_transform(real_img_grid), caption='Real Images'),
                         'Gif': wandb.Video(gif, fps=60, format='gif')})
 
