@@ -117,7 +117,7 @@ def construct_image_grid(model, device, image_size, image_channels, num_imgs):
 
 
 def main():
-    world_size = 4
+    world_size = 1
     if world_size > 1:
         
         mp.spawn(setup,
@@ -139,18 +139,18 @@ def setup(rank, world_size):
 def train_model(rank, world_size):
 
     # Define Hyperparameters
-    batch_size = 32
-    grad_iters = 4
+    batch_size = 8
+    grad_iters = 16
     epochs = 100
     lr = 3e-4
     device = rank
     channel_space = 128
 
-    image_size = 32
+    image_size = 64
     image_channels = 3
-    dim_mults = (1, 2, 2, 2)
+    dim_mults = (1, 2, 4, 8)
     attn_resos = (2, 4, 8)
-    dropout=0.3
+    dropout=0.1
     vartype = 'learned'
     n_log_images = 9        # How many images to log to wandb each epoch
     sampling_steps = 1000
@@ -159,11 +159,11 @@ def train_model(rank, world_size):
     data_path = "/home/bassets/diffusion_models/data/celebHQ/"
 
     # Define a diffusion process for training and one for sampling
-    train_diffuser = GaussianDiffusion(cosine_schedule(T), vartype, T)
-    sampler_diffuser = GaussianDiffusion(cosine_schedule(T), vartype, T, sampling_steps=list(range(0, T, T // sampling_steps)))
+    train_diffuser = GaussianDiffusion(linear_schedule(T), vartype, T)
+    sampler_diffuser = GaussianDiffusion(linear_schedule(T), vartype, T, sampling_steps=list(range(0, T, T // sampling_steps)))
 
     # Define the dataset
-    train_set = MNISTDataset()
+    train_set = CelebDataset(data_path)
 
     # If the world size is greater than 1, initialize a distributed sampler to split dataset up
     sampler = None if world_size <= 1 else DistributedSampler(train_set, shuffle=True)
@@ -206,8 +206,6 @@ def train_model(rank, world_size):
         # Zero out the gradients before starting batch
         optimizer.zero_grad()
 
-        optimizer.zero_grad()
-
         # Iterate over batch of images and random timesteps
         for batch_idx, images in enumerate(tqdm_train_loader):
             
@@ -216,11 +214,10 @@ def train_model(rank, world_size):
             images = images.to(device)
 
             # Use automatic mixed precision for loss calculation
-            with autocast():
-                loss = train_diffuser.compute_losses(model, images, device)
+            loss = train_diffuser.compute_losses(model, images, device)
 
-                # Apply loss to each prediction and update count
-                running_loss += loss.item()
+            # Apply loss to each prediction and update count
+            running_loss += loss.item()
 
             loss = loss / grad_iters
 
@@ -255,7 +252,7 @@ def train_model(rank, world_size):
             # Log all of the statistics to wandb
             wandb.log({'Loss': running_loss / len(train_loader),
                         'Training Iters': count * 4,
-                        'Generated Images': wandb.Image(reverse_transform(gen_img_grid), caption="Generated Images"),
+                        'Generated Images': wandb.Image(gen_img_grid, caption="Generated Images"),
                         'Real Images': wandb.Image(real_img_grid, caption='Real Images'),
                         'Gif': wandb.Video(gif, fps=60, format='gif')})
 
